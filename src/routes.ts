@@ -14,6 +14,14 @@ router.post('/auth/login', AuthController.login);
 // ================= PRODUCT ROUTES =================
 // Public: Semua orang bisa lihat produk
 router.get('/products', ProductController.getAll); 
+router.get('/products/:id', ProductController.getOne);
+
+
+// Protected Seller Routes
+router.get('/seller/products', authMiddleware, requireRole(['SELLER']), ProductController.getMyProducts);
+router.post('/products', authMiddleware, requireRole(['SELLER']), ProductController.create);
+router.put('/products/:id', authMiddleware, requireRole(['SELLER']), ProductController.update); // Update
+router.delete('/products/:id', authMiddleware, requireRole(['SELLER']), ProductController.delete); // Delete
 
 // Private: Cuma Seller yang bisa tambah produk
 router.post(
