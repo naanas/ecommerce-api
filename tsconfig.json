@@ -1,0 +1,49 @@
+{
+  "compilerOptions": {
+    /* Dasar Kompilasi */
+    "target": "es2016",
+    "module": "commonjs",
+    "lib": ["es6", "dom"],
+    "rootDir": "./src",
+    
+    /* Resolusi Modul & Path */
+    "moduleResolution": "node",
+    "baseUrl": "./",
+    "paths": {
+      "*": ["node_modules/*"]
+    },
+    
+    /* PENTING: Lokasi file definisi tipe custom */
+    "typeRoots": [
+      "./node_modules/@types",
+      "./src/types"
+    ],
+    "resolveJsonModule": true,
+
+    /* Interoperabilitas */
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+
+    /* Validasi & Strictness */
+    "strict": true,
+    "noImplicitAny": false, /* Ubah true jika ingin sangat ketat */
+    "skipLibCheck": true,
+    
+    /* Output */
+    "outDir": "./dist"
+  },
+  /* PENTING: Pastikan folder types ikut di-include */
+  "include": [
+    "src/**/*",
+    "src/types/**/*.d.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist"
+  ],
+  /* Konfigurasi khusus ts-node agar membaca file types */
+  "ts-node": {
+    "files": true,
+    "transpileOnly": true
+  }
+}
