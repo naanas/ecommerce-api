@@ -151,7 +151,7 @@ export class OrderController {
           {
             headers: {
               'Content-Type': 'application/json',
-              'x-server-key': serverKey // 👈 KUNCI RAHASIANYA DIKIRIM DISINI
+              'x-server-key': serverKey
             }
           }
         );
