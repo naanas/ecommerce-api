@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { supabase } from '../config/supabase';
+import { supabase } from '../config/supabase'; // Sesuaikan path config supabase kamu
 import axios from 'axios';
 
 // Interface Response dari Payment Orchestrator
@@ -17,17 +17,17 @@ interface OrchestratorResponse {
 
 export class OrderController {
   
-  // 1. Checkout (Create Order, Validasi Stok, Anti-Self-Buy, Payment Integration)
+  // =================================================================
+  // 1. CREATE ORDER (Checkout)
+  // =================================================================
   static async createOrder(req: Request, res: Response) {
     try {
       const user = (req as any).user;
+      
+      // 1. Validasi Auth
       if (!user) return res.status(401).json({ error: 'User not authenticated' });
-
-      // Validasi No HP
       if (!user.phone) {
-        return res.status(400).json({ 
-          error: 'Nomor HP wajib diisi. Mohon update profil.' 
-        });
+        return res.status(400).json({ error: 'Nomor HP wajib diisi. Mohon update profil.' });
       }
 
       const { items, payment_method_code } = req.body as any;
@@ -36,12 +36,13 @@ export class OrderController {
         return res.status(400).json({ error: 'Tidak ada barang yang di-checkout' });
       }
 
+      // 2. Variable untuk kalkulasi
       let totalAmount = 0;
       const orderItemsData: any[] = [];
       const productsToUpdate: any[] = [];
 
       // ==========================================================
-      // TAHAP 1: VALIDASI (STOK, HARGA & SELF-BUY)
+      // TAHAP 1: VALIDASI STOK, HARGA & SELF-BUY
       // ==========================================================
       for (const item of (items as any[])) {
         const { data: product } = await supabase
@@ -54,11 +55,9 @@ export class OrderController {
           return res.status(404).json({ error: `Produk ID ${item.product_id} tidak ditemukan` });
         }
 
-        // 🔥 Validasi: Tidak boleh beli barang sendiri
+        // Validasi: Tidak boleh beli barang sendiri
         if (product.seller_id === user.id) {
-          return res.status(400).json({ 
-            error: `Ups! Anda tidak bisa membeli produk sendiri: ${product.name}` 
-          });
+          return res.status(400).json({ error: `Anda tidak bisa membeli produk sendiri: ${product.name}` });
         }
 
         // Cek Stok
@@ -81,7 +80,7 @@ export class OrderController {
       }
 
       // ==========================================================
-      // TAHAP 2: SIMPAN ORDER KE DATABASE E-COMMERCE
+      // TAHAP 2: DATABASE TRANSACTION (SIMPAN ORDER)
       // ==========================================================
       
       // 2a. Buat Header Order
@@ -91,6 +90,7 @@ export class OrderController {
           buyer_id: user.id,
           total_amount: totalAmount,
           status: 'PENDING'
+          // payment_id masih NULL di sini
         })
         .select()
         .single();
@@ -124,29 +124,35 @@ export class OrderController {
         .eq('user_id', user.id);
 
       // ==========================================================
-      // TAHAP 3: INTEGRASI PAYMENT ORCHESTRATOR (UPDATED 🔥)
+      // TAHAP 3: INTEGRASI PAYMENT ORCHESTRATOR (PERBAIKAN DISINI)
       // ==========================================================
       try {
         const orchestratorUrl = process.env.PAYMENT_ORCHESTRATOR_URL;
-        const serverKey = process.env.PAYMENT_SERVER_KEY; // 👈 Pastikan ada di .env
+        const serverKey = process.env.PAYMENT_SERVER_KEY;
 
         if (!orchestratorUrl || !serverKey) {
-            throw new Error('Payment Config (URL/Key) missing in .env');
+            throw new Error('Konfigurasi Payment (URL/Key) hilang di .env');
         }
 
+        // PERHATIKAN INI: Pastikan tidak double slash //
+        // Jika orchestratorUrl = 'https://abc.com', maka hasilnya 'https://abc.com/api/payments'
+        // Sesuaikan '/api/payments' dengan route asli di Orchestrator lu.
+        const endpoint = `${orchestratorUrl.replace(/\/$/, '')}/api/payments/create`;
+
         const payload = {
+          order_id: order.id, // Sesuaikan field yg diminta orchestrator (order_id/reference_id?)
           amount: totalAmount,
-          payment_method: payment_method_code || 'BCA_VA',
-          customer_name: user.name,
+          payment_method: payment_method_code || 'BCA_VA', // Default payment
+          customer_name: user.name || 'Pelanggan',
           customer_email: user.email,
           customer_phone: user.phone,
-          reference_id: order.id,
           description: `Order #${order.id.substring(0, 8)}`
         };
 
-        // 🔥 BAGIAN PENTING: TAMBAHKAN HEADERS DISINI 🔥
+        console.log(`[BACKEND] Request ke Orchestrator: ${endpoint}`);
+
         const orchestratorResponse = await axios.post<OrchestratorResponse>(
-          `${orchestratorUrl}/payments/create`, 
+          endpoint, 
           payload,
           {
             headers: {
@@ -164,35 +170,51 @@ export class OrderController {
           .update({ payment_id: paymentData.transaction_id })
           .eq('id', order.id);
 
-        res.json({
+        // SUKSES SEMPURNA
+        res.status(201).json({
           success: true,
           data: {
             order_id: order.id,
             total_amount: totalAmount,
             status: 'PENDING',
+            payment_id: paymentData.transaction_id,
             payment_details: paymentData
           }
         });
 
       } catch (paymentError: any) {
-        console.error("Payment Error:", paymentError.response?.data || paymentError.message);
+        // LOG ERROR UNTUK DEBUGGING DI VERCEL
+        console.error("!!! GAGAL MENGHUBUNGI ORCHESTRATOR !!!");
+        if (paymentError.response) {
+            console.error("Status:", paymentError.response.status);
+            console.error("Response:", paymentError.response.data);
+        } else {
+            console.error("Error:", paymentError.message);
+        }
         
-        // Tetap return sukses create order walau payment gagal inisiasi
-        // (Supaya user tidak panik dan bisa coba bayar ulang nanti, walau logic re-pay belum ada)
+        // RETURN PARTIAL SUCCESS
+        // Kita return success: FALSE, tapi kasih data ordernya.
+        // Ini supaya frontend tau ordernya jadi, tapi paymentnya error.
         res.status(201).json({ 
-            success: true,
-            message: "Order created but payment initiation failed. Please contact admin.",
-            data: { order } 
+            success: false, // FLAG PENTING: Supaya frontend tidak munculin alert sukses sembarangan
+            message: "Order berhasil dibuat di database, namun gagal menginisiasi pembayaran. Silakan cek menu Pesanan.",
+            data: { 
+                order_id: order.id,
+                status: 'PENDING',
+                payment_id: null 
+            } 
         });
       }
 
     } catch (error: any) {
-      console.error("Create Order Error:", error.message);
+      console.error("Create Order Fatal Error:", error.message);
       res.status(500).json({ error: error.message });
     }
   }
 
-  // 2. Webhook Handler
+  // =================================================================
+  // 2. WEBHOOK HANDLER
+  // =================================================================
   static async handleWebhook(req: Request, res: Response) {
     try {
       const { transaction_id, status } = req.body;
@@ -225,7 +247,9 @@ export class OrderController {
     }
   }
 
-  // 3. Get My Orders
+  // =================================================================
+  // 3. GET MY ORDERS
+  // =================================================================
   static async getMyOrders(req: Request, res: Response) {
     try {
       const user = (req as any).user;
@@ -233,7 +257,7 @@ export class OrderController {
 
       const { data, error } = await supabase
         .from('orders')
-        .select('*, order_items(*, products(*))') // Pastikan payment_id ikut terambil
+        .select('*, order_items(*, products(*))') 
         .eq('buyer_id', user.id)
         .order('created_at', { ascending: false });
       
