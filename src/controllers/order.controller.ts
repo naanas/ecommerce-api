@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { supabase } from '../config/supabase'; // Sesuaikan path config supabase kamu
+import { supabase } from '../config/supabase';
 import axios from 'axios';
 
 // Interface Response dari Payment Orchestrator
@@ -30,14 +30,15 @@ export class OrderController {
         return res.status(400).json({ error: 'Nomor HP wajib diisi. Mohon update profil.' });
       }
 
-      const { items, payment_method_code } = req.body as any;
+      // [BARU] Ambil admin_fee dari body
+      const { items, payment_method_code, admin_fee } = req.body as any;
 
       if (!items || !Array.isArray(items) || items.length === 0) {
         return res.status(400).json({ error: 'Tidak ada barang yang di-checkout' });
       }
 
       // 2. Variable untuk kalkulasi
-      let totalAmount = 0;
+      let productTotal = 0;
       const orderItemsData: any[] = [];
       const productsToUpdate: any[] = [];
 
@@ -65,7 +66,7 @@ export class OrderController {
           return res.status(400).json({ error: `Stok habis untuk produk: ${product.name}` });
         }
 
-        totalAmount += product.price * item.quantity;
+        productTotal += product.price * item.quantity;
         
         orderItemsData.push({
           product_id: product.id,
@@ -79,18 +80,24 @@ export class OrderController {
         });
       }
 
+      // [BARU] Hitung Total Akhir (Barang + Admin Fee)
+      const fee = Number(admin_fee) || 0;
+      const finalTotalAmount = productTotal + fee;
+
       // ==========================================================
       // TAHAP 2: DATABASE TRANSACTION (SIMPAN ORDER)
       // ==========================================================
       
       // 2a. Buat Header Order
+      // Pastikan tabel 'orders' di Supabase sudah memiliki kolom 'admin_fee' (numeric/int)
       const { data: order, error: orderError } = await supabase
         .from('orders')
         .insert({
           buyer_id: user.id,
-          total_amount: totalAmount,
+          total_amount: finalTotalAmount, // Total yang sudah ditambah fee
+          admin_fee: fee,                 // Simpan fee agar tercatat
           status: 'PENDING'
-          // payment_id masih NULL di sini
+          // payment_id masih NULL di sini, diisi setelah response dari Orchestrator
         })
         .select()
         .single();
@@ -124,7 +131,7 @@ export class OrderController {
         .eq('user_id', user.id);
 
       // ==========================================================
-      // TAHAP 3: INTEGRASI PAYMENT ORCHESTRATOR (PERBAIKAN DISINI)
+      // TAHAP 3: INTEGRASI PAYMENT ORCHESTRATOR
       // ==========================================================
       try {
         const orchestratorUrl = process.env.PAYMENT_ORCHESTRATOR_URL;
@@ -134,15 +141,13 @@ export class OrderController {
             throw new Error('Konfigurasi Payment (URL/Key) hilang di .env');
         }
 
-        // PERHATIKAN INI: Pastikan tidak double slash //
-        // Jika orchestratorUrl = 'https://abc.com', maka hasilnya 'https://abc.com/api/payments'
-        // Sesuaikan '/api/payments' dengan route asli di Orchestrator lu.
+        // Pastikan tidak ada double slash di URL
         const endpoint = `${orchestratorUrl.replace(/\/$/, '')}/api/payments/create`;
 
         const payload = {
-          order_id: order.id, // Sesuaikan field yg diminta orchestrator (order_id/reference_id?)
-          amount: totalAmount,
-          payment_method: payment_method_code || 'BCA_VA', // Default payment
+          order_id: order.id,
+          amount: finalTotalAmount, // Kirim Total AKHIR ke Orchestrator
+          payment_method: payment_method_code || 'BCA_VA',
           customer_name: user.name || 'Pelanggan',
           customer_email: user.email,
           customer_phone: user.phone,
@@ -175,7 +180,8 @@ export class OrderController {
           success: true,
           data: {
             order_id: order.id,
-            total_amount: totalAmount,
+            total_amount: finalTotalAmount,
+            admin_fee: fee,
             status: 'PENDING',
             payment_id: paymentData.transaction_id,
             payment_details: paymentData
@@ -183,7 +189,7 @@ export class OrderController {
         });
 
       } catch (paymentError: any) {
-        // LOG ERROR UNTUK DEBUGGING DI VERCEL
+        // LOG ERROR UNTUK DEBUGGING
         console.error("!!! GAGAL MENGHUBUNGI ORCHESTRATOR !!!");
         if (paymentError.response) {
             console.error("Status:", paymentError.response.status);
@@ -194,12 +200,13 @@ export class OrderController {
         
         // RETURN PARTIAL SUCCESS
         // Kita return success: FALSE, tapi kasih data ordernya.
-        // Ini supaya frontend tau ordernya jadi, tapi paymentnya error.
+        // Ini supaya frontend tau ordernya jadi, tapi paymentnya error (bisa retry nanti).
         res.status(201).json({ 
-            success: false, // FLAG PENTING: Supaya frontend tidak munculin alert sukses sembarangan
+            success: false, 
             message: "Order berhasil dibuat di database, namun gagal menginisiasi pembayaran. Silakan cek menu Pesanan.",
             data: { 
                 order_id: order.id,
+                total_amount: finalTotalAmount,
                 status: 'PENDING',
                 payment_id: null 
             } 
