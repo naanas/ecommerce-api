@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { supabase } from '../config/supabase';
 import axios from 'axios';
+import crypto from 'crypto'; // [BARU] Import Crypto untuk validasi keamanan
 
 // Interface Response dari Payment Orchestrator
 interface OrchestratorResponse {
@@ -30,7 +31,7 @@ export class OrderController {
         return res.status(400).json({ error: 'Nomor HP wajib diisi. Mohon update profil.' });
       }
 
-      // [BARU] Ambil admin_fee dari body
+      // Ambil admin_fee dari body
       const { items, payment_method_code, admin_fee } = req.body as any;
 
       if (!items || !Array.isArray(items) || items.length === 0) {
@@ -80,7 +81,7 @@ export class OrderController {
         });
       }
 
-      // [BARU] Hitung Total Akhir (Barang + Admin Fee)
+      // Hitung Total Akhir (Barang + Admin Fee)
       const fee = Number(admin_fee) || 0;
       const finalTotalAmount = productTotal + fee;
 
@@ -88,23 +89,20 @@ export class OrderController {
       // TAHAP 2: DATABASE TRANSACTION (SIMPAN ORDER)
       // ==========================================================
       
-      // 2a. Buat Header Order
-      // Pastikan tabel 'orders' di Supabase sudah memiliki kolom 'admin_fee' (numeric/int)
       const { data: order, error: orderError } = await supabase
         .from('orders')
         .insert({
           buyer_id: user.id,
-          total_amount: finalTotalAmount, // Total yang sudah ditambah fee
-          admin_fee: fee,                 // Simpan fee agar tercatat
+          total_amount: finalTotalAmount, 
+          admin_fee: fee,                 
           status: 'PENDING'
-          // payment_id masih NULL di sini, diisi setelah response dari Orchestrator
         })
         .select()
         .single();
 
       if (orderError) throw orderError;
 
-      // 2b. Buat Order Items
+      // Buat Order Items
       const itemsToInsert = orderItemsData.map(i => ({
         ...i,
         order_id: order.id
@@ -116,7 +114,7 @@ export class OrderController {
 
       if (itemsError) throw itemsError;
 
-      // 2c. Potong Stok Produk
+      // Potong Stok Produk
       for (const prod of productsToUpdate) {
         await supabase
           .from('products')
@@ -124,7 +122,7 @@ export class OrderController {
           .eq('id', prod.id);
       }
 
-      // 2d. Bersihkan Keranjang
+      // Bersihkan Keranjang
       await supabase
         .from('cart_items')
         .delete()
@@ -141,12 +139,13 @@ export class OrderController {
             throw new Error('Konfigurasi Payment (URL/Key) hilang di .env');
         }
 
-        // Pastikan tidak ada double slash di URL
         const endpoint = `${orchestratorUrl.replace(/\/$/, '')}/api/payments/create`;
 
         const payload = {
           order_id: order.id,
-          amount: finalTotalAmount, // Kirim Total AKHIR ke Orchestrator
+          // [PENTING] Kirim Order ID sebagai reference_id untuk Idempotency Check
+          reference_id: order.id, 
+          amount: finalTotalAmount, 
           payment_method: payment_method_code || 'BCA_VA',
           customer_name: user.name || 'Pelanggan',
           customer_email: user.email,
@@ -175,7 +174,6 @@ export class OrderController {
           .update({ payment_id: paymentData.transaction_id })
           .eq('id', order.id);
 
-        // SUKSES SEMPURNA
         res.status(201).json({
           success: true,
           data: {
@@ -189,7 +187,6 @@ export class OrderController {
         });
 
       } catch (paymentError: any) {
-        // LOG ERROR UNTUK DEBUGGING
         console.error("!!! GAGAL MENGHUBUNGI ORCHESTRATOR !!!");
         if (paymentError.response) {
             console.error("Status:", paymentError.response.status);
@@ -198,12 +195,10 @@ export class OrderController {
             console.error("Error:", paymentError.message);
         }
         
-        // RETURN PARTIAL SUCCESS
-        // Kita return success: FALSE, tapi kasih data ordernya.
-        // Ini supaya frontend tau ordernya jadi, tapi paymentnya error (bisa retry nanti).
+        // Return success: false, tapi tetap kasih data order agar tidak hilang
         res.status(201).json({ 
             success: false, 
-            message: "Order berhasil dibuat di database, namun gagal menginisiasi pembayaran. Silakan cek menu Pesanan.",
+            message: "Order berhasil dibuat, namun pembayaran gagal diinisiasi. Cek Pesanan Saya.",
             data: { 
                 order_id: order.id,
                 total_amount: finalTotalAmount,
@@ -220,12 +215,37 @@ export class OrderController {
   }
 
   // =================================================================
-  // 2. WEBHOOK HANDLER
+  // 2. WEBHOOK HANDLER (DENGAN SECURITY CHECK)
   // =================================================================
   static async handleWebhook(req: Request, res: Response) {
     try {
       const { transaction_id, status } = req.body;
+      
+      // [BARU] Ambil Signature dan Secret
+      const signature = req.headers['x-signature'] as string;
+      const secret = process.env.WEBHOOK_SECRET || 'rahasia-super-aman'; // Wajib sama dengan Orchestrator
+
       console.log(`🔔 Webhook received for ${transaction_id}: ${status}`);
+
+      // [BARU] 1. Validasi Keberadaan Signature
+      if (!signature) {
+        console.warn("⛔ Missing Signature");
+        return res.status(401).json({ error: 'Missing Signature' });
+      }
+
+      // [BARU] 2. Hitung Ulang Signature dari Payload
+      const computedSignature = crypto
+        .createHmac('sha256', secret)
+        .update(JSON.stringify(req.body))
+        .digest('hex');
+
+      // [BARU] 3. Bandingkan Signature (Security Check)
+      if (signature !== computedSignature) {
+        console.warn(`⛔ Invalid Signature! Potential Hacker!`);
+        console.warn(`Received: ${signature}`);
+        console.warn(`Computed: ${computedSignature}`);
+        return res.status(403).json({ error: 'Invalid Signature' });
+      }
 
       if (!transaction_id || !status) return res.status(400).json({ error: 'Invalid payload' });
 
@@ -246,7 +266,7 @@ export class OrderController {
 
       if (error) throw error;
 
-      res.json({ success: true, message: 'Order status updated' });
+      res.json({ success: true, message: 'Order status updated securely' });
 
     } catch (error: any) {
       console.error("Webhook Error:", error.message);
