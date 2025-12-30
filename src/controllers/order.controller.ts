@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import { supabase } from '../config/supabase';
 import axios from 'axios';
-import crypto from 'crypto'; // [BARU] Import Crypto untuk validasi keamanan
+import crypto from 'crypto'; 
 
 // Interface Response dari Payment Orchestrator
 interface OrchestratorResponse {
@@ -31,7 +31,7 @@ export class OrderController {
         return res.status(400).json({ error: 'Nomor HP wajib diisi. Mohon update profil.' });
       }
 
-      // Ambil admin_fee dari body
+      // Ambil data dari body
       const { items, payment_method_code, admin_fee } = req.body as any;
 
       if (!items || !Array.isArray(items) || items.length === 0) {
@@ -42,6 +42,8 @@ export class OrderController {
       let productTotal = 0;
       const orderItemsData: any[] = [];
       const productsToUpdate: any[] = [];
+      // [FIX] Array untuk menampung ID produk yang dibeli (buat hapus keranjang nanti)
+      const purchasedProductIds: any[] = []; 
 
       // ==========================================================
       // TAHAP 1: VALIDASI STOK, HARGA & SELF-BUY
@@ -79,6 +81,9 @@ export class OrderController {
           id: product.id,
           newStock: product.stock - item.quantity
         });
+
+        // [FIX] Masukkan ID produk ke list yang akan dihapus dari keranjang
+        purchasedProductIds.push(product.id);
       }
 
       // Hitung Total Akhir (Barang + Admin Fee)
@@ -122,11 +127,18 @@ export class OrderController {
           .eq('id', prod.id);
       }
 
-      // Bersihkan Keranjang
-      await supabase
-        .from('cart_items')
-        .delete()
-        .eq('user_id', user.id);
+      // ==========================================================
+      // [FIXED] BERSIHKAN KERANJANG (HANYA YANG DIBELI)
+      // ==========================================================
+      if (purchasedProductIds.length > 0) {
+          await supabase
+            .from('cart_items')
+            .delete()
+            .eq('user_id', user.id)
+            .in('product_id', purchasedProductIds); // <--- Hapus cuma yang ada di list ini
+          
+          console.log(`🛒 Menghapus ${purchasedProductIds.length} item spesifik dari keranjang.`);
+      }
 
       // ==========================================================
       // TAHAP 3: INTEGRASI PAYMENT ORCHESTRATOR
@@ -143,8 +155,7 @@ export class OrderController {
 
         const payload = {
           order_id: order.id,
-          // [PENTING] Kirim Order ID sebagai reference_id untuk Idempotency Check
-          reference_id: order.id, 
+          reference_id: order.id, // Idempotency Key
           amount: finalTotalAmount, 
           payment_method: payment_method_code || 'BCA_VA',
           customer_name: user.name || 'Pelanggan',
@@ -174,6 +185,27 @@ export class OrderController {
           .update({ payment_id: paymentData.transaction_id })
           .eq('id', order.id);
 
+        // ============================================================
+        // [BARU] INSERT NOTIFIKASI "PESANAN DIBUAT" 📦
+        // ============================================================
+        try {
+            const { error: notifError } = await supabase.from('notifications').insert({
+                user_id: user.id, 
+                title: 'Pesanan Dibuat 📦',
+                message: `Pesanan #${order.id.substring(0, 8)} berhasil dibuat. Silakan selesaikan pembayaran sebesar Rp${finalTotalAmount.toLocaleString('id-ID')}.`,
+                is_read: false
+            });
+
+            if (notifError) {
+                console.error("⚠️ Gagal buat notif create order:", notifError.message);
+            } else {
+                console.log(`✅ Notif Create Order sent to User ${user.id}`);
+            }
+        } catch (err) {
+            console.error("Ignored Error (Notif):", err);
+        }
+        // ============================================================
+
         res.status(201).json({
           success: true,
           data: {
@@ -195,7 +227,7 @@ export class OrderController {
             console.error("Error:", paymentError.message);
         }
         
-        // Return success: false, tapi tetap kasih data order agar tidak hilang
+        // Tetap return success true agar order tidak hilang, user bisa coba bayar lagi nanti
         res.status(201).json({ 
             success: false, 
             message: "Order berhasil dibuat, namun pembayaran gagal diinisiasi. Cek Pesanan Saya.",
@@ -215,58 +247,85 @@ export class OrderController {
   }
 
   // =================================================================
-  // 2. WEBHOOK HANDLER (DENGAN SECURITY CHECK)
+  // 2. WEBHOOK HANDLER
   // =================================================================
   static async handleWebhook(req: Request, res: Response) {
     try {
       const { transaction_id, status } = req.body;
       
-      // [BARU] Ambil Signature dan Secret
       const signature = req.headers['x-signature'] as string;
-      const secret = process.env.WEBHOOK_SECRET || 'rahasia-super-aman'; // Wajib sama dengan Orchestrator
+      const secret = process.env.WEBHOOK_SECRET || 'rahasia-super-aman'; 
 
       console.log(`🔔 Webhook received for ${transaction_id}: ${status}`);
 
-      // [BARU] 1. Validasi Keberadaan Signature
+      // 1. Validasi Keberadaan Signature
       if (!signature) {
         console.warn("⛔ Missing Signature");
         return res.status(401).json({ error: 'Missing Signature' });
       }
 
-      // [BARU] 2. Hitung Ulang Signature dari Payload
+      // 2. Hitung Ulang Signature
       const computedSignature = crypto
         .createHmac('sha256', secret)
         .update(JSON.stringify(req.body))
         .digest('hex');
 
-      // [BARU] 3. Bandingkan Signature (Security Check)
+      // 3. Security Check
       if (signature !== computedSignature) {
         console.warn(`⛔ Invalid Signature! Potential Hacker!`);
-        console.warn(`Received: ${signature}`);
-        console.warn(`Computed: ${computedSignature}`);
         return res.status(403).json({ error: 'Invalid Signature' });
       }
 
       if (!transaction_id || !status) return res.status(400).json({ error: 'Invalid payload' });
 
-      // Cari order berdasarkan payment_id
+      // 4. Cari order & Select Buyer ID (PENTING)
       const { data: order } = await supabase
         .from('orders')
-        .select('id')
+        .select('id, buyer_id') 
         .eq('payment_id', transaction_id)
         .single();
 
-      if (!order) return res.status(404).json({ error: 'Order not found' });
+      if (!order) {
+        console.warn(`⚠️ Order not found for Transaction: ${transaction_id}`);
+        return res.status(404).json({ error: 'Order not found' });
+      }
 
-      // Update status order
-      const { error } = await supabase
+      // 5. Update status order
+      const { error: updateError } = await supabase
         .from('orders')
         .update({ status: status })
         .eq('id', order.id);
 
-      if (error) throw error;
+      if (updateError) throw updateError;
 
-      res.json({ success: true, message: 'Order status updated securely' });
+      // ==========================================
+      // INSERT NOTIFIKASI (WEBHOOK)
+      // ==========================================
+      if (status === 'SUCCESS' || status === 'FAILED') {
+          const title = status === 'SUCCESS' ? 'Pembayaran Berhasil! 🎉' : 'Pembayaran Gagal ❌';
+          const message = status === 'SUCCESS' 
+            ? `Pesanan #${order.id.substring(0,8)} telah lunas. Penjual akan segera memprosesnya.` 
+            : `Pembayaran untuk pesanan #${order.id.substring(0,8)} gagal. Silakan coba lagi.`;
+
+          if (order.buyer_id) {
+              const { error: notifError } = await supabase.from('notifications').insert({
+                  user_id: order.buyer_id,
+                  title: title,
+                  message: message,
+                  is_read: false
+              });
+              
+              if (notifError) {
+                  console.error("❌ GAGAL INSERT NOTIFIKASI WEBHOOK:", notifError.message);
+              } else {
+                  console.log(`✅ Notifikasi Webhook berhasil disimpan untuk User ${order.buyer_id}`);
+              }
+          } else {
+              console.warn("⚠️ Buyer ID null, skip notification");
+          }
+      }
+
+      res.json({ success: true, message: 'Order status updated & notification processed' });
 
     } catch (error: any) {
       console.error("Webhook Error:", error.message);

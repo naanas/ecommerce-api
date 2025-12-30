@@ -5,6 +5,7 @@ import { OrderController } from './controllers/order.controller';
 import { CartController } from './controllers/cart.controller';
 import { PaymentController } from './controllers/payment.controller'; // [BARU] Import PaymentController
 import { authMiddleware, requireRole } from './middleware/auth';
+import { NotificationController } from './controllers/notification.controller';
 
 const router = Router();
 
@@ -58,4 +59,7 @@ router.get('/payment/fee', authMiddleware, PaymentController.getPaymentFee);
 // ================= WEBHOOK ROUTE =================
 router.post('/webhook/payment', OrderController.handleWebhook);
 
+// ================= NOTIFICATION ROUTES =================
+router.get('/notifications', authMiddleware, NotificationController.getMyNotifications);
+router.post('/notifications/read', authMiddleware, NotificationController.markAsRead);
 export default router;
